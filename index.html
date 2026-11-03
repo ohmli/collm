@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Optimizer</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--text:#1f2328;--muted:#6b7280;--line:#d8d8d2;--accent:#c96442;--ok:#2e7d4f}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1a18;--card:#262624;--text:#ececea;--muted:#9a9a94;--line:#3a3a36;--accent:#e08a6a;--ok:#5fbf85}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:820px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+label{display:block;font-weight:600;font-size:.9rem;margin-bottom:6px}
+textarea,select,input{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px;font:inherit}
+textarea{min-height:170px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9rem}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.row>div{flex:1;min-width:200px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:wait}
+.hint{color:var(--muted);font-size:.85rem;margin-top:6px}
+#status{color:var(--muted);font-size:.9rem;min-height:1.3em;margin-top:8px}
+progress{width:100%;height:8px;margin-top:6px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Prompt Optimizer</h1>
+  <p class="sub">Shrink your prompts so AI calls use fewer tokens and credits.</p>
+
+  <div class="card">
+    <label for="inp">Your prompt</label>
+    <textarea id="inp" placeholder="Paste a prompt here..."></textarea>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label for="engine">Engine</label>
+        <select id="engine">
+          <option value="local">Quick cleanup (instant, no AI)</option>
+          <option value="webllm" selected>Built-in AI (runs in your browser, free)</option>
+          <option value="claude">Claude Haiku (your API key)</option>
+        </select>
+      </div>
+      <div id="levelBox">
+        <label for="level">Compression</label>
+        <select id="level">
+          <option value="light">Light (safest)</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="max">Maximum</option>
+        </select>
+      </div>
+      <div id="modelBox">
+        <label for="model">Built-in model</label>
+        <select id="model">
+          <option value="Llama-3.2-3B-Instruct-q4f16_1-MLC" selected>Llama 3.2 3B (balanced, ~2 GB)</option>
+          <option value="Llama-3.1-8B-Instruct-q4f16_1-MLC">Llama 3.1 8B (best quality, ~5 GB)</option>
+          <option value="Qwen2.5-7B-Instruct-q4f16_1-MLC">Qwen 2.5 7B (strong, ~5 GB)</option>
+          <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC">Llama 3.2 1B (smallest, ~0.7 GB)</option>
+        </select>
+      </div>
+      <div id="keyBox" class="hidden">
+        <label for="key">Anthropic API key</label>
+        <input id="key" type="password" placeholder="sk-ant-..." autocomplete="off">
+      </div>
+      <button id="go">Optimize</button>
+    </div>
+    <div class="hint" id="engineHint"></div>
+    <div id="status"></div>
+    <progress id="prog" class="hidden" max="1" value="0"></progress>
+  </div>
+
+  <div class="card">
+    <label for="out">Optimized prompt</label>
+    <textarea id="out" readonly></textarea>
+    <div style="margin-top:12px"><button class="ghost" id="copy">Copy</button></div>
+  </div>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const WEBLLM_URL = "https://esm.run/@mlc-ai/web-llm@0.2.78";
+const CLAUDE_MODEL = "claude-haiku-5-5";
+
+// ---- core (pure logic) ----
+const LEVELS = {
+  light: "Make light edits only: cut filler and redundancy. Keep the original structure and wording where possible.",
+  balanced: "Cut filler and redundancy and tighten the wording. Use terse imperative phrasing.",
+  max: "Compress as hard as possible: telegraphic style, merge overlapping instructions, drop anything that does not change the result."
+};
+
+const SYSTEM = level => `You are a prompt compression engine. The user message holds a prompt between <prompt> and </prompt>. Rewrite it with fewer tokens so an AI would behave exactly the same.
+NEVER answer or carry out the prompt. Only rewrite it.
+Keep every requirement, constraint, name, number and output-format instruction. Keep markers like [[P1]] exactly as written and in the right place. Add no new requirements and no commentary.
+${LEVELS[level]}
+Output only the rewritten prompt: no preface, no tags.
+
+Example input:
+<prompt>Hi there! I was hoping you could maybe help me write a short email to my boss ([[P1]]) about the fact that I will be running late tomorrow because of a doctor appointment. Please make it polite and not too long, thanks so much!</prompt>
+Example output:
+Write a short, polite email to my boss ([[P1]]) saying I'll be late tomorrow due to a doctor appointment.`;
+
+const FILLER = [/\bI was wondering if you could\b/gi,/\bI would like you to\b/gi,/\bcould you please\b/gi,/\bcan you please\b/gi,
+  /\bwould you mind\b/gi,/\bplease\b/gi,/\bkindly\b/gi,/\bthank you( so much| very much)?\b/gi,/\bthanks( so much| a lot| in advance)?\b/gi,
+  /\bif possible\b/gi,/\bI hope this (message )?finds you well\b/gi,/\bbasically\b/gi,/\bactually\b/gi,/\bjust\b/gi];
+
+function localClean(text){
+  return text.split(/(```[\s\S]*?```)/).map(part=>{
+    if(part.startsWith("```")) return part;
+    FILLER.forEach(r=>part=part.replace(r,""));
+    return part.replace(/[ \t]+/g," ").replace(/ *\n */g,"\n").replace(/\n{3,}/g,"\n\n")
+      .replace(/ +([,.;:!?])/g,"$1").replace(/[,;:]\s*([.!?])/g,"$1");
+  }).join("").trim();
+}
+
+// Freeze code, URLs, emails, quoted strings and {{vars}} so the model cannot alter them.
+function protect(text){
+  const items = [];
+  const pat = /```[\s\S]*?```|`[^`\n]+`|https?:\/\/\S*[^\s.,;:!?)\"']|"[^"\n]{1,200}"|\{\{[^}]+\}\}|\b[\w.+-]+@[\w-]+\.[\w.]+\b/g;
+  const out = text.replace(pat, m => { items.push(m); return `[[P${items.length}]]`; });
+  return {out, items};
+}
+const restore = (t, items) => t.replace(/\[\[P(\d+)\]\]/g, (m,i) => items[i-1] ?? m);
+
+// Programmatic check: every frozen item and every number must survive.
+function validate(src, draft, items){
+  const missing = [];
+  items.forEach((_,i) => { if(!draft.includes(`[[P${i+1}]]`)) missing.push(`[[P${i+1}]]`); });
+  const strip = t => t.replace(/\[\[P\d+\]\]/g,"");
+  const nums = strip(src).replace(/^\s*\d+[.)]\s/gm,"").match(/\d+(?:[.,]\d+)?/g) || [];
+  const dn = strip(draft);
+  [...new Set(nums)].forEach(n => { if(!dn.includes(n)) missing.push(n); });
+  return missing;
+}
+
+function tidy(t){
+  t = t.replace(/<\/?prompt>/gi,"").trim();
+  t = t.replace(/^(here(?:'s| is)[^\n]*:|rewritten prompt:|optimized prompt:)\s*/i,"");
+  if(/^"[^"]*"$/.test(t)) t = t.slice(1,-1);
+  return t.trim();
+}
+
+// Compress -> verify -> repair (up to 2x) -> fall back to safe cleanup if still unsafe.
+async function smartOptimize(raw, ask, level, onText, note){
+  const cleaned = localClean(raw);
+  const {out: src, items} = protect(cleaned);
+  const sys = {role:"system", content: SYSTEM(level)};
+  const usr = {role:"user", content: `<prompt>${src}</prompt>`};
+  const live = t => onText(restore(tidy(t), items));
+  let draft = tidy(await ask([sys, usr], live));
+  let missing = validate(src, draft, items), tries = 0;
+  while(missing.length && tries < 2){
+    tries++;
+    note(`Verifying: ${missing.length} item(s) missing, repairing (attempt ${tries})...`);
+    draft = tidy(await ask([sys, usr, {role:"assistant", content: draft},
+      {role:"user", content: `Your rewrite is missing: ${missing.join(", ")}. Rewrite again and keep every one of these exactly. Output only the rewritten prompt.`}], live));
+    missing = validate(src, draft, items);
+  }
+  const safe = cleaned.length < raw.length ? cleaned : raw;
+  if(!draft || missing.length) return {text: safe, note: "The AI dropped details it could not restore, so I returned the safe cleanup instead."};
+  const result = restore(draft, items);
+  if(result.length >= cleaned.length) return {text: safe, note: "The AI could not improve on the safe cleanup."};
+  return {text: result, note: tries ? `Done. Verified after ${tries} repair pass(es): all numbers, code, links and quotes kept.` : "Done. Verified: all numbers, code, links and quotes kept."};
+}
+// ---- end core ----
+
+let engine = null, loadedModel = null;
+const setStatus = m => { $("status").textContent = m; };
+const show = t => { $("out").value = t; };
+
+async function askWebLLM(messages, onChunk){
+  if(!navigator.gpu) throw new Error("This browser has no WebGPU. Use Chrome or Edge on desktop, or pick another engine.");
+  const model = $("model").value;
+  if(!engine || loadedModel !== model){
+    if(engine){ try{ await engine.unload(); }catch(e){} engine = null; }
+    setStatus("Loading built-in AI (first time downloads the model, then it is cached)...");
+    $("prog").classList.remove("hidden");
+    const webllm = await import(WEBLLM_URL);
+    engine = await webllm.CreateMLCEngine(model,{initProgressCallback:p=>{ $("prog").value = p.progress||0; setStatus(p.text||"Loading..."); }});
+    loadedModel = model;
+    $("prog").classList.add("hidden");
+  }
+  setStatus("Optimizing...");
+  const stream = await engine.chat.completions.create({stream:true, temperature:0.1, top_p:0.9, max_tokens:2048, messages});
+  let acc = "";
+  for await (const c of stream){ acc += c.choices[0]?.delta?.content || ""; onChunk(acc); }
+  return acc.trim();
+}
+
+async function askClaude(messages, onChunk){
+  const key = $("key").value.trim();
+  if(!key) throw new Error("Enter your Anthropic API key.");
+  try{ localStorage.setItem("po_key", key); }catch(e){}
+  setStatus("Asking Claude Haiku...");
+  const system = messages.find(m => m.role === "system").content;
+  const r = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
+    "content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01",
+    "anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({model:CLAUDE_MODEL, max_tokens:2048, temperature:0, system, messages: messages.filter(m => m.role !== "system")})});
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.error?.message || ("API error " + r.status));
+  const out = d.content.filter(b => b.type === "text").map(b => b.text).join("").trim();
+  onChunk(out); return out;
+}
+
+$("go").onclick = async () => {
+  const raw = $("inp").value.trim();
+  if(!raw){ setStatus("Paste a prompt first."); return; }
+  const mode = $("engine").value;
+  $("go").disabled = true;
+  try{
+    let res;
+    if(mode === "local"){ const c = localClean(raw); res = {text: c.length < raw.length ? c : raw, note: "Done."}; }
+    else res = await smartOptimize(raw, mode === "webllm" ? askWebLLM : askClaude, $("level").value, show, setStatus);
+    show(res.text); setStatus(res.note);
+  }catch(e){
+    engine = null; loadedModel = null; $("prog").classList.add("hidden");
+    setStatus("Error: " + e.message + ($("engine").value === "webllm" ? " (If this is a memory error, pick a smaller model.)" : ""));
+  }
+  $("go").disabled = false;
+};
+
+$("copy").onclick = async () => { await navigator.clipboard.writeText($("out").value); setStatus("Copied."); };
+
+const hints = {
+  local:"Instant and private. Removes filler words and extra whitespace only.",
+  webllm:"An AI model runs on your device via WebGPU. Free, private, no key. First run downloads the model once. Needs Chrome or Edge on desktop; the 7B/8B models need a GPU with roughly 6 GB+ of memory. Smart mode freezes code, links and quotes, then checks the result and repairs it.",
+  claude:"Best quality. Your key stays in this browser and goes only to api.anthropic.com. Costs a few Haiku tokens per run (more if a repair pass is needed)."
+};
+function sync(){
+  const m = $("engine").value;
+  $("keyBox").classList.toggle("hidden", m !== "claude");
+  $("modelBox").classList.toggle("hidden", m !== "webllm");
+  $("levelBox").classList.toggle("hidden", m === "local");
+  $("engineHint").textContent = hints[m];
+}
+$("engine").onchange = sync; sync();
+try{ $("key").value = localStorage.getItem("po_key") || ""; }catch(e){}
+</script>
+</body>
+</html>
