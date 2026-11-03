@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Optimizer</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--text:#1f2328;--muted:#6b7280;--line:#d8d8d2;--accent:#c96442;--ok:#2e7d4f}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1a18;--card:#262624;--text:#ececea;--muted:#9a9a94;--line:#3a3a36;--accent:#e08a6a;--ok:#5fbf85}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:820px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+label{display:block;font-weight:600;font-size:.9rem;margin-bottom:6px}
+textarea,select,input{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:10px;font:inherit}
+textarea{min-height:170px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9rem}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.row>div{flex:1;min-width:200px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:wait}
+.stats{display:flex;gap:20px;flex-wrap:wrap;margin:10px 0;font-weight:600}
+.stats .save{color:var(--ok)}
+.hint{color:var(--muted);font-size:.85rem;margin-top:6px}
+#status{color:var(--muted);font-size:.9rem;min-height:1.3em;margin-top:8px}
+progress{width:100%;height:8px;margin-top:6px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Prompt Optimizer</h1>
+  <p class="sub">Shrink your prompts so AI calls use fewer tokens and credits.</p>
+
+  <div class="card">
+    <label for="inp">Your prompt</label>
+    <textarea id="inp" placeholder="Paste a prompt here..."></textarea>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label for="engine">Engine</label>
+        <select id="engine">
+          <option value="local">Quick cleanup (instant, no AI)</option>
+          <option value="webllm" selected>Built-in AI (runs in your browser, free)</option>
+          <option value="claude">Claude Haiku (your API key)</option>
+        </select>
+      </div>
+      <div id="modelBox">
+        <label for="model">Built-in model</label>
+        <select id="model">
+          <option value="Llama-3.2-3B-Instruct-q4f16_1-MLC" selected>Llama 3.2 3B (balanced, ~2 GB)</option>
+          <option value="Llama-3.1-8B-Instruct-q4f16_1-MLC">Llama 3.1 8B (best quality, ~5 GB)</option>
+          <option value="Qwen2.5-7B-Instruct-q4f16_1-MLC">Qwen 2.5 7B (strong, ~5 GB)</option>
+          <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC">Llama 3.2 1B (smallest, ~0.7 GB)</option>
+        </select>
+      </div>
+      <div id="keyBox" class="hidden">
+        <label for="key">Anthropic API key</label>
+        <input id="key" type="password" placeholder="sk-ant-..." autocomplete="off">
+      </div>
+      <button id="go">Optimize</button>
+    </div>
+    <div class="hint" id="engineHint"></div>
+    <div id="status"></div>
+    <progress id="prog" class="hidden" max="1" value="0"></progress>
+  </div>
+
+  <div class="card">
+    <label for="out">Optimized prompt</label>
+    <textarea id="out" readonly></textarea>
+    <div class="stats"><span id="s1">Before: 0</span><span id="s2">After: 0</span><span id="s3" class="save"></span></div>
+    <button class="ghost" id="copy">Copy</button>
+    <div class="hint">Token counts are estimates (about 4 characters per token).</div>
+  </div>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const WEBLLM_URL = "https://esm.run/@mlc-ai/web-llm@0.2.78";
+const CLAUDE_MODEL = "claude-haiku-5-5";
+
+const SYSTEM = `You compress prompts. Rewrite the user's text so it uses as few tokens as possible while an AI would still do exactly the same task.
+Rules: keep every requirement, constraint, number, name, code snippet and output-format instruction. Remove pleasantries, repetition, hedging and filler. Use terse imperative phrasing. Do NOT answer the prompt and do NOT add anything new.
+Output ONLY the rewritten prompt, with no preface and no quotes.`;
+
+const FILLER = [/\bI was wondering if you could\b/gi,/\bI would like you to\b/gi,/\bcould you please\b/gi,/\bcan you please\b/gi,
+  /\bwould you mind\b/gi,/\bplease\b/gi,/\bkindly\b/gi,/\bthank you( so much| very much)?\b/gi,/\bthanks( in advance)?\b/gi,
+  /\bif possible\b/gi,/\bI hope this (message )?finds you well\b/gi,/\bbasically\b/gi,/\bactually\b/gi,/\bjust\b/gi];
+
+function localClean(text){
+  return text.split(/(```[\s\S]*?```)/).map(part=>{
+    if(part.startsWith("```")) return part;
+    FILLER.forEach(r=>part=part.replace(r,""));
+    return part.replace(/[ \t]+/g," ").replace(/ *\n */g,"\n").replace(/\n{3,}/g,"\n\n")
+      .replace(/ +([,.;:!?])/g,"$1").replace(/[,;:]\s*([.!?])/g,"$1");
+  }).join("").trim();
+}
+const tok = t => t.trim() ? Math.ceil(t.length/4) : 0;
+
+let engine = null, loadedModel = null;
+function setStatus(msg){ $("status").textContent = msg; }
+
+async function runWebLLM(text, onChunk){
+  if(!navigator.gpu) throw new Error("This browser has no WebGPU. Use Chrome or Edge on desktop, or pick another engine.");
+  const model = $("model").value;
+  if(!engine || loadedModel !== model){
+    if(engine){ try{ await engine.unload(); }catch(e){} engine = null; }
+    setStatus("Loading built-in AI (first time downloads the model, then it is cached)...");
+    $("prog").classList.remove("hidden");
+    const webllm = await import(WEBLLM_URL);
+    engine = await webllm.CreateMLCEngine(model,{initProgressCallback:p=>{
+      $("prog").value = p.progress||0; setStatus(p.text||"Loading...");
+    }});
+    loadedModel = model;
+    $("prog").classList.add("hidden");
+  }
+  setStatus("Optimizing...");
+  const stream = await engine.chat.completions.create({
+    stream:true, temperature:0.2, max_tokens:2048,
+    messages:[{role:"system",content:SYSTEM},{role:"user",content:text}]
+  });
+  let acc="";
+  for await (const c of stream){ acc += c.choices[0]?.delta?.content||""; onChunk(acc); }
+  return acc.trim();
+}
+
+async function runClaude(text, onChunk){
+  const key = $("key").value.trim();
+  if(!key) throw new Error("Enter your Anthropic API key.");
+  try{ localStorage.setItem("po_key",key); }catch(e){}
+  setStatus("Asking Claude Haiku...");
+  const r = await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
+    "content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01",
+    "anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:CLAUDE_MODEL,max_tokens:2048,system:SYSTEM,messages:[{role:"user",content:text}]})});
+  const d = await r.json();
+  if(!r.ok) throw new Error(d.error?.message||("API error "+r.status));
+  const out = d.content.filter(b=>b.type==="text").map(b=>b.text).join("").trim();
+  onChunk(out); return out;
+}
+
+function show(before, text){
+  $("out").value = text;
+  const a = tok(text), saved = before-a;
+  $("s1").textContent = "Before: "+before; $("s2").textContent = "After: "+a;
+  $("s3").textContent = before ? "Saved "+saved+" ("+Math.round(saved/before*100)+"%)" : "";
+}
+
+$("go").onclick = async () => {
+  const raw = $("inp").value.trim();
+  if(!raw){ setStatus("Paste a prompt first."); return; }
+  const before = tok(raw), cleaned = localClean(raw), mode = $("engine").value;
+  $("go").disabled = true;
+  try{
+    let result = cleaned;
+    if(mode==="webllm") result = await runWebLLM(cleaned, t=>show(before,t));
+    if(mode==="claude") result = await runClaude(cleaned, t=>show(before,t));
+    // Never return something longer than the cleaned prompt, or empty.
+    if(!result || tok(result) >= tok(cleaned)) result = tok(cleaned) < before ? cleaned : raw;
+    show(before, result);
+    setStatus("Done.");
+  }catch(e){
+    engine = null; loadedModel = null; $("prog").classList.add("hidden");
+    setStatus("Error: "+e.message+($("engine").value==="webllm"?" (If this is a memory error, pick a smaller model.)":""));
+  }
+  $("go").disabled = false;
+};
+
+$("copy").onclick = async () => {
+  await navigator.clipboard.writeText($("out").value); setStatus("Copied.");
+};
+
+const hints = {
+  local:"Instant and private. Removes filler words and extra whitespace only.",
+  webllm:"An AI model runs on your device via WebGPU. Free, private, no key. First run downloads the model once (sizes shown above). Needs Chrome or Edge on desktop; the 7B/8B models need a GPU with roughly 6 GB+ of memory.",
+  claude:"Best quality. Your key stays in this browser and goes only to api.anthropic.com. Costs a few Haiku tokens per run."
+};
+function sync(){ const m=$("engine").value; $("keyBox").classList.toggle("hidden",m!=="claude"); $("modelBox").classList.toggle("hidden",m!=="webllm"); $("engineHint").textContent=hints[m]; }
+$("engine").onchange = sync; sync();
+try{ $("key").value = localStorage.getItem("po_key")||""; }catch(e){}
+</script>
+</body>
+</html>
